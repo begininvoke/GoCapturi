@@ -7,17 +7,19 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
+	"github.com/gomutex/godocx"
+	"github.com/gomutex/godocx/docx"
 	"log"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
 )
 
 var (
@@ -155,8 +157,10 @@ func main() {
 		switch ev := v.(type) {
 		case *network.EventRequestWillBeSent:
 			requestDomain := extractDomain(ev.Request.URL)
-			if !isDomainMatch(requestDomain, *domainFlag) {
-				return
+			if *domainFlag != "" {
+				if !isDomainMatch(requestDomain, *domainFlag) {
+					return
+				}
 			}
 
 			requestsMu.Lock()
@@ -253,7 +257,13 @@ func main() {
 	}
 
 	if *modeFlag == "extractbody" || *modeFlag == "all" {
-		writeExtractedCSV(*outputDir, extractedEntries)
+		if strings.ToLower(*format) == "doc" {
+			if err := writeExtractDOCX(*outputDir, extractedEntries); err != nil {
+				log.Fatalf("Failed to write extractall.docx: %v", err)
+			}
+		} else {
+			writeExtractedCSV(*outputDir, extractedEntries)
+		}
 	}
 	if *modeFlag == "network" || *modeFlag == "all" {
 		switch strings.ToLower(*format) {
@@ -261,12 +271,98 @@ func main() {
 			writeCSV(*outputDir, dataList)
 		case "json":
 			writeJSON(*outputDir, dataList)
+		case "doc":
+			sort.Slice(dataList, func(i, j int) bool {
+				return dataList[i].SequenceID < dataList[j].SequenceID
+			})
+			if err := writeDOCX(*outputDir, dataList); err != nil {
+				log.Fatalf("Failed to write requests.docx: %v", err)
+			}
 		default:
 			log.Fatalf("Unsupported format: %s", *format)
 		}
 	}
 
 	log.Println("Analysis completed")
+}
+func writeDOCX(outputDir string, dataList []*reqResData) error {
+
+	doc, err := godocx.NewDocument()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, data := range dataList {
+		// Add a bold request heading
+		doc.AddParagraph("").AddText(fmt.Sprintf("Request #%d: %s %s", data.SequenceID, data.Method, data.URL)).Bold(true)
+
+		// Add fields
+		addField(doc, "URL", data.URL)
+		addField(doc, "Method", data.Method)
+		addField(doc, "Request Headers", data.RequestHeaders)
+		addField(doc, "Request Body", data.RequestBody)
+		addField(doc, "Response Status", fmt.Sprintf("%.0f", data.ResponseStatus))
+		addField(doc, "Response Headers", data.ResponseHeaders)
+		addField(doc, "Response Body", string(data.ResponseBody))
+
+		// Add a blank line for spacing
+		doc.AddParagraph("")
+	}
+
+	// Save DOCX file
+	path := filepath.Join(outputDir, "requests.docx")
+
+	err = doc.SaveTo(path)
+	if err != nil {
+		return fmt.Errorf("failed to save DOCX: %w", err)
+	}
+
+	return nil
+}
+
+func writeExtractDOCX(outputDir string, entries []extractedData) error {
+	path := filepath.Join(outputDir, "extractall.docx")
+	document, err := godocx.NewDocument()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, entry := range entries {
+		document.AddParagraph(" ").AddText(fmt.Sprintf("Type: %s", entry.ExtractType)).Bold(true)
+		document.AddParagraph(" ").AddText(fmt.Sprintf("Source: %s", entry.Address))
+		document.AddParagraph(" ").AddText(fmt.Sprintf("Content: %s", entry.Content))
+
+		// Add a blank line for spacing
+		document.AddParagraph(" ")
+	}
+
+	// Save DOCX file
+	err = document.SaveTo(path)
+	if err != nil {
+		return fmt.Errorf("failed to save DOCX: %w", err)
+	}
+
+	return nil
+}
+
+func addField(doc *docx.RootDoc, label string, value interface{}) {
+	doc.AddParagraph(" ").AddText(label + ": ").Bold(true)
+
+	switch v := value.(type) {
+	case map[string]interface{}:
+		jsonData, err := json.MarshalIndent(v, "", "  ")
+		if err != nil {
+			doc.AddParagraph(" ").AddText(fmt.Sprintf("%v", v))
+		} else {
+			doc.AddParagraph(" ").AddText(string(jsonData))
+		}
+	case string:
+		doc.AddParagraph(" ").AddText(v)
+	case []byte:
+		doc.AddParagraph(" ").AddText(string(v))
+	default:
+		doc.AddParagraph(" ").AddText(fmt.Sprintf("%v", v))
+	}
 }
 
 func extractDomain(rawURL string) string {
@@ -372,31 +468,6 @@ func writeJSON(outputDir string, dataList []*reqResData) {
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	encoder.Encode(output)
-}
-
-func isImageOrFont(contentType, url string) bool {
-	pattern := regexp.MustCompile(`(?i)(image/.*|font/.*|\.png$|\.jpe?g$|\.gif$|\.bmp$|\.webp$|\.woff2?$|\.ttf$|\.otf$|\.eot$)`)
-	return pattern.MatchString(contentType) || pattern.MatchString(url)
-}
-
-func saveAsset(downloadsDir, url2 string, body []byte, counter *int) {
-	parsedURL, err := url.Parse(url2)
-	if err != nil {
-		return
-	}
-
-	fileName := sanitizeFilename(filepath.Base(parsedURL.Path))
-	if fileName == "" {
-		*counter++
-		fileName = fmt.Sprintf("asset_%d", *counter)
-	}
-
-	filePath := filepath.Join(downloadsDir, fileName)
-	os.WriteFile(filePath, body, 0644)
-}
-
-func sanitizeFilename(name string) string {
-	return regexp.MustCompile(`[\\/:*?"<>|]`).ReplaceAllString(name, "_")
 }
 
 type extractedData struct {
