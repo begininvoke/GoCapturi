@@ -7,10 +7,6 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/chromedp/cdproto/network"
-	"github.com/chromedp/chromedp"
-	"github.com/gomutex/godocx"
-	"github.com/gomutex/godocx/docx"
 	"log"
 	"net/url"
 	"os"
@@ -20,6 +16,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
+	"github.com/gomutex/godocx"
+	"github.com/gomutex/godocx/docx"
 )
 
 var (
@@ -30,6 +31,8 @@ var (
 	modeFlag    = flag.String("mode", "all", "Operation mode: extractbody, network, or all")
 	outputDir   = flag.String("o", ".", "Output directory for results")
 	timeoutFlag = flag.Duration("timeout", 30*time.Second, "Time to wait after navigation to capture requests")
+	excludeFlag = flag.String("exclude", "", "Comma-separated file extensions to exclude (e.g., jpg,png,css,woff,woff2,gif,svg)")
+	ignoreFlag  = flag.String("ignore", "", "Comma-separated file extensions to exclude (e.g., jpg,png,css,woff,woff2,gif,svg)")
 )
 
 type reqResData struct {
@@ -45,50 +48,7 @@ type reqResData struct {
 	RequestTime     time.Time              `json:"request_time"`
 	ResponseTime    time.Time              `json:"response_time"`
 	TimeDiff        string                 `json:"time_diff"`
-}
-
-func parseCurlCommand(curlCmd string) ([]string, map[string]string, string) {
-	cookiePattern := `-H\s+'cookie:\s*(.*?)'`
-	cookieRegex := regexp.MustCompile(cookiePattern)
-	cookieMatches := cookieRegex.FindStringSubmatch(curlCmd)
-	var cookies []string
-	if len(cookieMatches) > 1 {
-		cookies = strings.Split(cookieMatches[1], ";")
-	}
-
-	headerPattern := `-H\s+'([^:]+):\s*([^']+)'`
-	headerRegex := regexp.MustCompile(headerPattern)
-	headerMatches := headerRegex.FindAllStringSubmatch(curlCmd, -1)
-	headers := make(map[string]string)
-	for _, match := range headerMatches {
-		headers[match[1]] = match[2]
-	}
-
-	urlPattern := `https?://([a-zA-Z0-9.-]+)`
-	urlRegex := regexp.MustCompile(urlPattern)
-	urlMatches := urlRegex.FindStringSubmatch(curlCmd)
-	domain := ""
-	if len(urlMatches) > 1 {
-		fullDomain := urlMatches[1]
-		parts := strings.Split(fullDomain, ".")
-		if len(parts) > 2 {
-			domain = "." + strings.Join(parts[len(parts)-2:], ".")
-		} else {
-			domain = "." + fullDomain
-		}
-	}
-
-	return cookies, headers, domain
-}
-
-func getRootDomain(domain string) string {
-	domain = strings.TrimPrefix(domain, "http://")
-	domain = strings.TrimPrefix(domain, "https://")
-	domainParts := strings.Split(domain, ".")
-	if len(domainParts) > 2 {
-		return "." + strings.Join(domainParts[len(domainParts)-2:], ".")
-	}
-	return domain
+	SkipBody        bool                   `json:"-"`
 }
 
 func main() {
@@ -98,22 +58,13 @@ func main() {
 		log.Fatal("Please provide a URL using the -url flag")
 	}
 
-	os.MkdirAll(*outputDir, 0755)
+	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+		log.Fatalf("Failed to create output directory: %v", err)
+	}
 
-	ctx, cancel := chromedp.NewExecAllocator(context.Background(),
-		append(
-			chromedp.DefaultExecAllocatorOptions[:],
-			chromedp.Flag("headless", false),
-			chromedp.Flag("disable-gpu", false),
-			chromedp.Flag("start-maximized", true),
-		)...,
-	)
-	defer cancel()
-
-	ctx, cancel = chromedp.NewContext(ctx)
-	defer cancel()
-
-	ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
+	excludeExts := parseExcludeExtensions(*excludeFlag)
+	ignoreExts := parseExcludeExtensions(*ignoreFlag)
+	ctx, cancel := setupBrowserContext()
 	defer cancel()
 
 	var (
@@ -124,83 +75,66 @@ func main() {
 	)
 
 	if *cookieFlag != "" {
-		cookies, _, domain := parseCurlCommand(*cookieFlag)
-		domain = getRootDomain(domain)
-
-		err := chromedp.Run(ctx, network.Enable())
-		if err != nil {
-			log.Fatalf("Failed to enable network: %v", err)
-		}
-
-		err = chromedp.Run(ctx, network.ClearBrowserCookies())
-		if err != nil {
-			log.Printf("Failed to clear cookies: %v", err)
-		}
-
-		for _, cookie := range cookies {
-			parts := strings.SplitN(cookie, "=", 2)
-			if len(parts) == 2 {
-				name, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
-				err := chromedp.Run(ctx, network.SetCookie(name, value).
-					WithDomain(domain).
-					WithPath("/").
-					WithHTTPOnly(false).
-					WithSecure(false))
-				if err != nil {
-					log.Printf("Failed to set cookie %s: %v", name, err)
-				}
-			}
+		if err := setCookies(ctx, *cookieFlag); err != nil {
+			log.Fatalf("Failed to set cookies: %v", err)
 		}
 	}
+	listenNetworkEvents(ctx, &requests, &finished, &requestsMu, &sequenceID, excludeExts, ignoreExts)
 
+	if err := navigateAndCapture(ctx); err != nil {
+		log.Fatal(err)
+	}
+
+	dataList := processFinishedRequests(ctx, &requests, &finished, &requestsMu)
+
+	extractedEntries := extractAllData(dataList)
+
+	generateOutputs(dataList, extractedEntries)
+
+	log.Println("Analysis completed")
+}
+func listenNetworkEvents(ctx context.Context, requests *map[network.RequestID]*reqResData, finished *[]network.RequestID, mu *sync.Mutex, seqID *int, excludeExts map[string]struct{}, ignoreExts map[string]struct{}) {
 	chromedp.ListenTarget(ctx, func(v interface{}) {
 		switch ev := v.(type) {
 		case *network.EventRequestWillBeSent:
 			requestDomain := extractDomain(ev.Request.URL)
-			if *domainFlag != "" {
-				if !isDomainMatch(requestDomain, *domainFlag) {
-					return
-				}
+			if *domainFlag != "" && !isDomainMatch(requestDomain, *domainFlag) {
+				return
 			}
 
-			requestsMu.Lock()
-			defer requestsMu.Unlock()
-			if _, exists := requests[ev.RequestID]; !exists {
-				sequenceID++
-				reqBody := ""
-				if ev.Request.HasPostData {
-					go func(id network.RequestID) {
-						var body string
-						err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-							var err error
-							body, err = network.GetRequestPostData(id).Do(ctx)
-							return err
-						}))
-						if err == nil {
-							requestsMu.Lock()
-							if data, ok := requests[id]; ok {
-								data.RequestBody = string(body)
-							}
-							requestsMu.Unlock()
-						}
-					}(ev.RequestID)
-				}
-
-				requests[ev.RequestID] = &reqResData{
-					SequenceID:     sequenceID,
-					Domain:         extractDomain(ev.Request.URL),
-					URL:            ev.Request.URL,
-					Method:         ev.Request.Method,
-					RequestHeaders: ev.Request.Headers,
-					RequestBody:    reqBody,
-					RequestTime:    time.Now(),
-				}
+			mu.Lock()
+			defer mu.Unlock()
+			if _, exists := ignoreExts[getExtension(ev.Request.URL)]; exists {
+				return
 			}
+			if _, exists := (*requests)[ev.RequestID]; exists {
+				return
+			}
+
+			ext := getExtension(ev.Request.URL)
+			_, skipBody := excludeExts[ext]
+
+			*seqID++
+			reqData := &reqResData{
+				SequenceID:     *seqID,
+				Domain:         requestDomain,
+				URL:            ev.Request.URL,
+				Method:         ev.Request.Method,
+				RequestHeaders: ev.Request.Headers,
+				RequestTime:    time.Now(),
+				SkipBody:       skipBody,
+			}
+
+			if ev.Request.HasPostData && !skipBody {
+				go fetchRequestBody(ctx, ev.RequestID, requests, mu)
+			}
+
+			(*requests)[ev.RequestID] = reqData
 
 		case *network.EventResponseReceived:
-			requestsMu.Lock()
-			defer requestsMu.Unlock()
-			if data, exists := requests[ev.RequestID]; exists {
+			mu.Lock()
+			defer mu.Unlock()
+			if data, exists := (*requests)[ev.RequestID]; exists {
 				data.ResponseStatus = float64(ev.Response.Status)
 				data.ResponseHeaders = ev.Response.Headers
 				data.ResponseTime = time.Now()
@@ -208,82 +142,11 @@ func main() {
 			}
 
 		case *network.EventLoadingFinished:
-			requestsMu.Lock()
-			defer requestsMu.Unlock()
-			finished = append(finished, ev.RequestID)
+			mu.Lock()
+			*finished = append(*finished, ev.RequestID)
+			mu.Unlock()
 		}
 	})
-
-	if err := chromedp.Run(ctx,
-		network.Enable(),
-		chromedp.Navigate(*outputURL),
-		chromedp.ActionFunc(autoScroll),
-		chromedp.Sleep(*timeoutFlag),
-	); err != nil {
-		log.Fatal(err)
-	}
-
-	requestsMu.Lock()
-	finishedIDs := finished
-	requestsMu.Unlock()
-
-	var dataList []*reqResData
-	for _, id := range finishedIDs {
-		var buf []byte
-		err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			var err error
-			buf, err = network.GetResponseBody(id).Do(ctx)
-			return err
-		}))
-		if err != nil {
-			continue
-		}
-
-		requestsMu.Lock()
-		if data, exists := requests[id]; exists {
-			data.ResponseBody = buf
-			dataList = append(dataList, data)
-		}
-		requestsMu.Unlock()
-	}
-
-	var extractedEntries []extractedData
-	seen := make(map[string]bool)
-	for _, data := range dataList {
-		extractData(data.RequestBody, data.URL+"[RequestBody]", &extractedEntries, seen)
-		extractData(string(data.ResponseBody), data.URL+"[ResponseBody]", &extractedEntries, seen)
-		extractData(fmt.Sprintf("%q", data.ResponseHeaders), data.URL+"[ResponseHeaders]", &extractedEntries, seen)
-		extractData(fmt.Sprintf("%q", data.RequestHeaders), data.URL+"[RequestHeaders]", &extractedEntries, seen)
-	}
-
-	if *modeFlag == "extractbody" || *modeFlag == "all" {
-		if strings.ToLower(*format) == "doc" {
-			if err := writeExtractDOCX(*outputDir, extractedEntries); err != nil {
-				log.Fatalf("Failed to write extractall.docx: %v", err)
-			}
-		} else {
-			writeExtractedCSV(*outputDir, extractedEntries)
-		}
-	}
-	if *modeFlag == "network" || *modeFlag == "all" {
-		switch strings.ToLower(*format) {
-		case "csv":
-			writeCSV(*outputDir, dataList)
-		case "json":
-			writeJSON(*outputDir, dataList)
-		case "doc":
-			sort.Slice(dataList, func(i, j int) bool {
-				return dataList[i].SequenceID < dataList[j].SequenceID
-			})
-			if err := writeDOCX(*outputDir, dataList); err != nil {
-				log.Fatalf("Failed to write requests.docx: %v", err)
-			}
-		default:
-			log.Fatalf("Unsupported format: %s", *format)
-		}
-	}
-
-	log.Println("Analysis completed")
 }
 func writeDOCX(outputDir string, dataList []*reqResData) error {
 
@@ -469,6 +332,35 @@ func writeJSON(outputDir string, dataList []*reqResData) {
 	encoder.SetIndent("", "  ")
 	encoder.Encode(output)
 }
+func writeExtractedJSON(outputDir string, entries []extractedData) {
+	type jsonEntry struct {
+		Type    string `json:"type"`
+		Source  string `json:"source"`
+		Content string `json:"content"`
+	}
+
+	var output []jsonEntry
+	for _, entry := range entries {
+		output = append(output, jsonEntry{
+			Type:    entry.ExtractType,
+			Source:  entry.Address,
+			Content: entry.Content,
+		})
+	}
+
+	path := filepath.Join(outputDir, "extractall.json")
+	file, err := os.Create(path)
+	if err != nil {
+		log.Fatalf("Failed to create JSON file: %v", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(output); err != nil {
+		log.Fatalf("Failed to write JSON data: %v", err)
+	}
+}
 
 type extractedData struct {
 	ExtractType string
@@ -529,7 +421,8 @@ func autoScroll(ctx context.Context) error {
 }
 func extractData(body string, url string, entries *[]extractedData, seen map[string]bool) {
 	patterns := map[string]*regexp.Regexp{
-		"link":                          regexp.MustCompile(`/(href|src)\s*=\s*["']((https?:\/\/|www\.)[^"'\s>]+)["']/gi`),
+		"link":                          regexp.MustCompile(`(?i)(href|src)\s*=\s*["']((https?:\/\/|www\.)[^"'\s>]+)["']|https?:\/\/[^\s<>"']+|www\.[^\s<>"']+`),
+		"domain":                        regexp.MustCompile(`(?i)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:com|net|ir|org|br|fr|ai|edu)(?:\.[a-z]{2,})*[/'\"]`),
 		"email":                         regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`),
 		"ipv4":                          regexp.MustCompile(`\b(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}\b`),
 		"file_path":                     regexp.MustCompile(`(?i)([\p{L}\d_\-~/][\p{L}\d_\-~./\\]*\.(?:txt|pdf|docx?|xlsx?|pptx?|jpg|jpeg|png|gif|bmp|svg|woff2?|ttf|eot|otf|zip|tar\.gz))|\b(?:/|\./|\.\./)[\p{L}\d_\-~./\\]+\b`),
@@ -548,10 +441,6 @@ func extractData(body string, url string, entries *[]extractedData, seen map[str
 		"authorization_basic":           regexp.MustCompile(`basic [a-zA-Z0-9=:_\+\/-]{5,100}`),
 		"authorization_bearer":          regexp.MustCompile(`bearer [a-zA-Z0-9_\-\.=:_\+\/]{5,100}`),
 		"authorization_api":             regexp.MustCompile(`api[key|_key|\s+]+[a-zA-Z0-9_\-]{5,100}`),
-		"mailgun_api_key":               regexp.MustCompile(`key-[0-9a-zA-Z]{32}`),
-		"twilio_api_key":                regexp.MustCompile(`SK[0-9a-fA-F]{32}`),
-		"twilio_account_sid":            regexp.MustCompile(`AC[a-zA-Z0-9_\-]{32}`),
-		"twilio_app_sid":                regexp.MustCompile(`AP[a-zA-Z0-9_\-]{32}`),
 		"paypal_braintree_access_token": regexp.MustCompile(`access_token\$production\$[0-9a-z]{16}\$[0-9a-f]{32}`),
 		"square_oauth_secret":           regexp.MustCompile(`sq0csp-[0-9A-Za-z\-_]{43}|sq0[a-z]{3}-[0-9A-Za-z\-_]{22,43}`),
 		"square_access_token":           regexp.MustCompile(`sqOatp-[0-9A-Za-z\-_]{22}|EAAA[a-zA-Z0-9]{60}`),
@@ -571,7 +460,7 @@ func extractData(body string, url string, entries *[]extractedData, seen map[str
 	for label, regex := range patterns {
 		matches := regex.FindAllString(body, -1)
 		for _, match := range matches {
-			key := fmt.Sprintf("%s|%s", label, match)
+			key := match
 			if !seen[key] {
 				*entries = append(*entries, extractedData{
 					ExtractType: label,
@@ -582,4 +471,242 @@ func extractData(body string, url string, entries *[]extractedData, seen map[str
 			}
 		}
 	}
+
+}
+func parseCurlCommand(curlCmd string) ([]string, map[string]string, string) {
+	cookiePattern := `-H\s+'cookie:\s*(.*?)'`
+	cookieRegex := regexp.MustCompile(cookiePattern)
+	cookieMatches := cookieRegex.FindStringSubmatch(curlCmd)
+	var cookies []string
+	if len(cookieMatches) > 1 {
+		cookies = strings.Split(cookieMatches[1], ";")
+	}
+
+	headerPattern := `-H\s+'([^:]+):\s*([^']+)'`
+	headerRegex := regexp.MustCompile(headerPattern)
+	headerMatches := headerRegex.FindAllStringSubmatch(curlCmd, -1)
+	headers := make(map[string]string)
+	for _, match := range headerMatches {
+		headers[match[1]] = match[2]
+	}
+
+	urlPattern := `https?://([a-zA-Z0-9.-]+)`
+	urlRegex := regexp.MustCompile(urlPattern)
+	urlMatches := urlRegex.FindStringSubmatch(curlCmd)
+	domain := ""
+	if len(urlMatches) > 1 {
+		fullDomain := urlMatches[1]
+		parts := strings.Split(fullDomain, ".")
+		if len(parts) > 2 {
+			domain = "." + strings.Join(parts[len(parts)-2:], ".")
+		} else {
+			domain = "." + fullDomain
+		}
+	}
+
+	return cookies, headers, domain
+}
+
+func getRootDomain(domain string) string {
+	domain = strings.TrimPrefix(domain, "http://")
+	domain = strings.TrimPrefix(domain, "https://")
+	domainParts := strings.Split(domain, ".")
+	if len(domainParts) > 2 {
+		return "." + strings.Join(domainParts[len(domainParts)-2:], ".")
+	}
+	return domain
+}
+func parseExcludeExtensions(excludeStr string) map[string]struct{} {
+	excludeExts := make(map[string]struct{})
+	if excludeStr == "" {
+		return excludeExts
+	}
+
+	for _, ext := range strings.Split(excludeStr, ",") {
+		ext = strings.TrimSpace(ext)
+		if ext == "" {
+			continue
+		}
+		if !strings.HasPrefix(ext, ".") {
+			ext = "." + ext
+		}
+		excludeExts[strings.ToLower(ext)] = struct{}{}
+	}
+	return excludeExts
+}
+func setupBrowserContext() (context.Context, context.CancelFunc) {
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", false),
+		chromedp.Flag("disable-gpu", true),
+	)
+
+	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
+	ctx, cancel = chromedp.NewContext(ctx)
+	ctx, cancel = context.WithTimeout(ctx, 90*time.Second)
+	return ctx, cancel
+}
+func setCookies(ctx context.Context, curlCmd string) error {
+	cookies, _, domain := parseCurlCommand(curlCmd)
+	domain = getRootDomain(domain)
+
+	if err := chromedp.Run(ctx, network.Enable(), network.ClearBrowserCookies()); err != nil {
+		return err
+	}
+
+	for _, cookie := range cookies {
+		parts := strings.SplitN(cookie, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		name, value := strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1])
+		err := chromedp.Run(ctx,
+			network.SetCookie(name, value).
+				WithDomain(domain).
+				WithPath("/").
+				WithHTTPOnly(false).
+				WithSecure(false),
+		)
+		if err != nil {
+			log.Printf("Failed to set cookie %s: %v", name, err)
+		}
+	}
+	return nil
+}
+func navigateAndCapture(ctx context.Context) error {
+	return chromedp.Run(ctx,
+		network.Enable(),
+		chromedp.Navigate(*outputURL),
+		chromedp.ActionFunc(autoScroll),
+		chromedp.Sleep(*timeoutFlag),
+	)
+}
+func fetchRequestBody(ctx context.Context, id network.RequestID, requests *map[network.RequestID]*reqResData, mu *sync.Mutex) {
+	var body string
+	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		var err error
+		body, err = network.GetRequestPostData(id).Do(ctx)
+		return err
+	}))
+
+	if err != nil {
+		//log.Printf("Failed to fetch request body: %v", err)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if data, exists := (*requests)[id]; exists && !data.SkipBody {
+		data.RequestBody = body
+	}
+}
+func processFinishedRequests(ctx context.Context, requests *map[network.RequestID]*reqResData, finished *[]network.RequestID, mu *sync.Mutex) []*reqResData {
+	var dataList []*reqResData
+	mu.Lock()
+	finishedIDs := *finished
+	mu.Unlock()
+
+	for _, id := range finishedIDs {
+		mu.Lock()
+		data, exists := (*requests)[id]
+		mu.Unlock()
+
+		if !exists {
+			continue
+		}
+
+		var buf []byte
+		if !data.SkipBody {
+			err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+				var err error
+				buf, err = network.GetResponseBody(id).Do(ctx)
+				return err
+			}))
+			if err != nil {
+				log.Printf("Failed to fetch response body for %s: %v", data.URL, err)
+			}
+		}
+
+		mu.Lock()
+		data.ResponseBody = buf
+		dataList = append(dataList, data)
+		mu.Unlock()
+	}
+
+	sort.Slice(dataList, func(i, j int) bool {
+		return dataList[i].SequenceID < dataList[j].SequenceID
+	})
+
+	return dataList
+}
+func extractAllData(dataList []*reqResData) []extractedData {
+	var extractedEntries []extractedData
+	seen := make(map[string]bool)
+
+	for _, data := range dataList {
+		sources := []struct {
+			content string
+			prefix  string
+		}{
+			{data.RequestBody, data.URL + "[RequestBody]"},
+			{string(data.ResponseBody), data.URL + "[ResponseBody]"},
+			{fmt.Sprintf("%q", data.ResponseHeaders), data.URL + "[ResponseHeaders]"},
+			{fmt.Sprintf("%q", data.RequestHeaders), data.URL + "[RequestHeaders]"},
+		}
+
+		for _, source := range sources {
+			extractData(source.content, source.prefix, &extractedEntries, seen)
+		}
+	}
+
+	return extractedEntries
+}
+func generateOutputs(dataList []*reqResData, extractedEntries []extractedData) {
+	if *modeFlag == "extractbody" || *modeFlag == "all" {
+		switch strings.ToLower(*format) {
+		case "csv":
+			writeExtractedCSV(*outputDir, extractedEntries)
+		case "doc":
+			writeExtractDOCX(*outputDir, extractedEntries)
+		case "json":
+			writeExtractedJSON(*outputDir, extractedEntries)
+		default: // Default to CSV
+			log.Fatalf("Unsupported format: %s", *format)
+		}
+	}
+
+	if *modeFlag == "network" || *modeFlag == "all" {
+		switch strings.ToLower(*format) {
+		case "csv":
+			writeCSV(*outputDir, dataList)
+		case "json":
+			writeJSON(*outputDir, dataList)
+		case "doc":
+			writeDOCX(*outputDir, dataList)
+		default:
+			log.Fatalf("Unsupported format: %s", *format)
+		}
+	}
+}
+func getExtension(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+
+	// Split path to get the last segment
+	path := u.Path
+	if len(path) == 0 {
+		return ""
+	}
+
+	// Remove query parameters and fragments
+	cleanPath := strings.SplitN(path, "?", 2)[0]
+	cleanPath = strings.SplitN(cleanPath, "#", 2)[0]
+
+	// Get base filename and extension
+	base := filepath.Base(cleanPath)
+	ext := filepath.Ext(base)
+
+	// Return lowercase extension for consistent comparison
+	return strings.ToLower(ext)
 }
