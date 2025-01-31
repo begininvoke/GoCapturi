@@ -535,10 +535,7 @@ func parseExcludeExtensions(excludeStr string) map[string]struct{} {
 	return excludeExts
 }
 func setupBrowserContext() (context.Context, context.CancelFunc) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", false),
-		chromedp.Flag("disable-gpu", true),
-	)
+	opts := append(chromedp.DefaultExecAllocatorOptions[:])
 
 	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancel = chromedp.NewContext(ctx)
