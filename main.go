@@ -655,6 +655,11 @@ func extractAllData(dataList []*reqResData) []extractedData {
 		}
 	}
 
+	// Sort extractedEntries by ExtractType
+	sort.Slice(extractedEntries, func(i, j int) bool {
+		return extractedEntries[i].ExtractType < extractedEntries[j].ExtractType
+	})
+
 	return extractedEntries
 }
 func generateOutputs(dataList []*reqResData, extractedEntries []extractedData) {
