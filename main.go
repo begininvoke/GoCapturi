@@ -29,7 +29,7 @@ var (
 	format      = flag.String("format", "csv", "Output format (csv or json)")
 	cookieFlag  = flag.String("cookie", "", "Cookies and headers to set before navigating to the URL")
 	modeFlag    = flag.String("mode", "all", "Operation mode: extractbody, network, or all")
-	outputDir   = flag.String("o", ".", "Output directory for results")
+	outputDir   = flag.String("o", "./results/results.csv", "Output directory for results")
 	timeoutFlag = flag.Duration("timeout", 30*time.Second, "Time to wait after navigation to capture requests")
 	excludeFlag = flag.String("exclude", "", "Comma-separated file extensions to exclude (e.g., jpg,png,css,woff,woff2,gif,svg)")
 	ignoreFlag  = flag.String("ignore", "", "Comma-separated file extensions to exclude (e.g., jpg,png,css,woff,woff2,gif,svg)")
@@ -173,9 +173,9 @@ func writeDOCX(outputDir string, dataList []*reqResData) error {
 	}
 
 	// Save DOCX file
-	path := filepath.Join(outputDir, "requests.docx")
+	//path := filepath.Join(outputDir, "requests.docx")
 
-	err = doc.SaveTo(path)
+	err = doc.SaveTo(outputDir)
 	if err != nil {
 		return fmt.Errorf("failed to save DOCX: %w", err)
 	}
@@ -184,7 +184,7 @@ func writeDOCX(outputDir string, dataList []*reqResData) error {
 }
 
 func writeExtractDOCX(outputDir string, entries []extractedData) error {
-	path := filepath.Join(outputDir, "extractall.docx")
+	//path := filepath.Join(outputDir, "extractall.docx")
 	document, err := godocx.NewDocument()
 	if err != nil {
 		log.Fatal(err)
@@ -200,7 +200,7 @@ func writeExtractDOCX(outputDir string, entries []extractedData) error {
 	}
 
 	// Save DOCX file
-	err = document.SaveTo(path)
+	err = document.SaveTo(outputDir)
 	if err != nil {
 		return fmt.Errorf("failed to save DOCX: %w", err)
 	}
@@ -321,8 +321,8 @@ func writeJSON(outputDir string, dataList []*reqResData) {
 		})
 	}
 
-	path := filepath.Join(outputDir, "requests.json")
-	file, err := os.Create(path)
+	//path := filepath.Join(outputDir, "requests.json")
+	file, err := os.Create(outputDir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -348,8 +348,8 @@ func writeExtractedJSON(outputDir string, entries []extractedData) {
 		})
 	}
 
-	path := filepath.Join(outputDir, "extractall.json")
-	file, err := os.Create(path)
+	//path := filepath.Join(outputDir, "extractall.json")
+	file, err := os.Create(outputDir)
 	if err != nil {
 		log.Fatalf("Failed to create JSON file: %v", err)
 	}
@@ -369,8 +369,8 @@ type extractedData struct {
 }
 
 func writeExtractedCSV(outputDir string, entries []extractedData) {
-	path := filepath.Join(outputDir, "extractall.csv")
-	file, err := os.Create(path)
+	//path := filepath.Join(outputDir, "extractall.csv")
+	file, err := os.Create(outputDir)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -535,7 +535,7 @@ func parseExcludeExtensions(excludeStr string) map[string]struct{} {
 	return excludeExts
 }
 func setupBrowserContext() (context.Context, context.CancelFunc) {
-	opts := append(chromedp.DefaultExecAllocatorOptions[:])
+	opts := chromedp.DefaultExecAllocatorOptions[:]
 
 	ctx, cancel := chromedp.NewExecAllocator(context.Background(), opts...)
 	ctx, cancel = chromedp.NewContext(ctx)
