@@ -58,7 +58,8 @@ func main() {
 		log.Fatal("Please provide a URL using the -url flag")
 	}
 
-	if err := os.MkdirAll(*outputDir, 0755); err != nil {
+	dir := filepath.Dir(*outputDir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		log.Fatalf("Failed to create output directory: %v", err)
 	}
 
@@ -248,8 +249,8 @@ func isDomainMatch(requestDomain, filterDomain string) bool {
 	return requestDomain == filterDomain
 }
 func writeCSV(outputDir string, dataList []*reqResData) {
-	path := filepath.Join(outputDir, "requests.csv")
-	file, err := os.Create(path)
+	//path := filepath.Join(outputDir, "requests.csv")
+	file, err := os.Create(outputDir)
 	if err != nil {
 		log.Fatal(err)
 	}
