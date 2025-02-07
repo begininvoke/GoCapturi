@@ -37,11 +37,13 @@ go run main.go -url [TARGET_URL] [OPTIONS]
 |------------|--------------------------------------------------|
 | `-url`     | **Required** Target URL to analyze              |
 | `-domain`  | Filter requests by domain (e.g., "example.com") |
-| `-format`  | Output format: csv or json (default: csv)       |
+| `-format`  | Output format: csv, json, or doc (default: csv) |
 | `-cookie`  | Curl command containing cookies/headers to set  |
 | `-mode`    | Operation mode: extractbody, network, or all (default: all) |
 | `-o`       | Output directory (default: current directory)   |
 | `-timeout` | Wait time after navigation (default: 30s)       |
+| `-exclude` | Comma-separated file extensions to exclude (e.g., jpg,png,css) |
+| `-ignore`  | Comma-separated file extensions to ignore completely (e.g., jpg,png,css) |
 
 ## Examples
 
@@ -70,14 +72,24 @@ go run main.go -url https://example.com -cookie "curl 'https://example.com' -H '
 go run main.go -url https://example.com -timeout 1m
 ```
 
+### Excluding specific file types:
+```bash
+go run main.go -url https://example.com -exclude jpg,png,css -ignore woff,woff2
+```
+
+### Generating DOCX report:
+```bash
+go run main.go -url https://example.com -format doc -o report.docx
+```
+
 ## Output Files
 
-- `requests.csv/json` - Full network capture data containing:
+- `requests.csv/json/doc` - Full network capture data containing:
     - Request/response headers
     - Status codes
     - Timings
     - Bodies (base64 encoded)
-- `extractall.csv` - All detected sensitive patterns with:
+- `extractall.csv/json/doc` - All detected sensitive patterns with:
     - Data type (e.g., "github_access_token")
     - Source URL
     - Matched content
